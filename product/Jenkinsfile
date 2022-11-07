@@ -1,0 +1,245 @@
+pipeline 
+{
+    options 
+    {
+        timestamps()
+    }
+    agent any
+    tools
+    {
+        maven 'Maven3.6.2' 
+        jdk 'jdk8'
+    }
+    stages 
+    {
+        stage("Checkout") 
+        {
+            steps 
+            {
+                deleteDir()
+                checkout scm
+            }
+        }
+        stage("Calculate tag")
+        {
+            when
+            {
+                anyOf
+                {
+                    branch "release/*"
+                }
+            }
+            steps
+            {
+                script
+                {
+                    withCredentials([string(credentialsId: 'api_token', variable: 'TOKEN')]) { 
+                        sh "git fetch http://jenkins:$TOKEN@3.11.200.189/Maciob/product --tags"
+                    }
+                    sh "echo 'calculate tag'"
+                    BRANCH = env.BRANCH_NAME
+                    sh "echo '${BRANCH}'"
+                    PREFIX = sh(returnStdout: true, script:"echo '${BRANCH}' | cut -d '/' -f2").trim()
+                    sh "echo '${PREFIX}'"
+                    ORIGINAL = sh(returnStdout: true, script:"git tag | grep ${PREFIX} | tail -1 | cut -d '/' -f2").trim()
+                    sh "echo '${ORIGINAL}'"
+                    try
+                    {
+                        SUFFIX = sh(returnStdout: true, script:"echo '${ORIGINAL}' | cut -d '.' -f3 ").trim()
+                        SUFFIX = "${SUFFIX}" as int
+                        SUFFIX = SUFFIX + 1
+                        TAG = sh(returnStdout: true, script:"echo '${PREFIX}.${SUFFIX}'").trim()
+                        sh "echo '${TAG}'"
+                    }
+                    catch(exc)
+                    {             
+                        TAG = sh(returnStdout: true, script:"echo '${PREFIX}.0'").trim()
+                        sh "echo '${TAG}'"                   
+                    }
+                    sh "mvn versions:set -DnewVersion=${TAG}"
+                    withCredentials([string(credentialsId: 'secret_jfrog', variable: 'PASS')]) 
+                    { 
+                        SUFFIXtelemetry = sh(returnStdout: true, script: "curl -s -u admin:$PASS http://3.11.200.189:8081/artifactory/libs-release-local/com/lidar/telemetry/ | grep -F ${PREFIX} | cut -d '/' -f1 | cut -d '.' -f3 |sort -n | tail -1").trim()
+                        SUFFIXanalytics = sh(returnStdout: true, script: "curl -s -u admin:$PASS http://3.11.200.189:8081/artifactory/libs-release-local/com/lidar/analytics/ | grep -F ${PREFIX} | cut -d '/' -f1 | cut -d '.' -f3 |sort -n | tail -1").trim()
+                    }
+                    try
+                    {
+                        sh "mvn versions:set-property -DnewVersion='${PREFIX}.${SUFFIXtelemetry}' -Dproperty=telemetry.version"
+                        sh "mvn versions:commit"
+                        sh "mvn versions:set-property -DnewVersion='${PREFIX}.${SUFFIXanalytics}' -Dproperty=analytics.version"
+                        sh "mvn versions:commit"
+                    }
+                    catch(exc)
+                    {
+                        sh "mvn versions:set-property -DnewVersion='${PREFIX}.0' -Dproperty=telemetry.version"
+                        sh "mvn versions:commit"
+                        sh "mvn versions:set-property -DnewVersion='${PREFIX}.0' -Dproperty=analytics.version"
+                        sh "mvn versions:commit"
+
+                    }
+                }
+            }
+        }
+        stage('Build') 
+        {
+            when
+            {
+                anyOf
+                {
+                    branch "release/*"
+                }
+            }
+            steps 
+            {
+                script 
+                {
+                    configFileProvider([configFile(fileId: '8412b7f1-a630-4f33-9b49-fe3e1de2ad03',variable: 'MAVEN_SETTINGS_XML')]) 
+                    {
+                        sh "mvn -s $MAVEN_SETTINGS_XML clean compile"
+                    }
+                }
+            }
+        }
+        stage('Dependencies')
+        {
+            when
+            {
+                anyOf
+                {
+                    branch "release/*"
+                }
+            }
+            steps
+            {
+                script
+                {
+                    configFileProvider([configFile(fileId: '8412b7f1-a630-4f33-9b49-fe3e1de2ad03',variable: 'MAVEN_SETTINGS_XML')]) 
+                    {
+                        sh "mvn -s $MAVEN_SETTINGS_XML dependency:list"
+                    }
+                }
+            }
+        }
+        stage('Test') 
+        {
+            when
+            {
+                anyOf
+                {
+                    branch "release/*"
+                }
+            }
+            steps 
+            {
+                script 
+                {
+                    configFileProvider([configFile(fileId: '8412b7f1-a630-4f33-9b49-fe3e1de2ad03',variable: 'MAVEN_SETTINGS_XML')]) 
+                    {
+                        sh "mvn -s $MAVEN_SETTINGS_XML clean test"
+                    }
+                }
+            }
+        }
+        stage('Package') 
+        {
+            when
+            {
+                anyOf
+                {
+                    branch "release/*"
+                }
+            }
+            steps 
+            {
+                script 
+                {
+                    configFileProvider([configFile(fileId: '8412b7f1-a630-4f33-9b49-fe3e1de2ad03',variable: 'MAVEN_SETTINGS_XML')]) 
+                    {
+                        sh "mvn -s $MAVEN_SETTINGS_XML clean package"
+                    }
+                }
+            }
+        }
+        stage('E2E') 
+        {
+            when
+            {
+                anyOf
+                {
+                    branch "release/*"
+                }
+            }
+            steps 
+            {
+                script 
+                {
+                    configFileProvider([configFile(fileId: '8412b7f1-a630-4f33-9b49-fe3e1de2ad03',variable: 'MAVEN_SETTINGS_XML')]) 
+                    {
+                        sh "mvn -s $MAVEN_SETTINGS_XML dependency:get -Dartifact=com.lidar:simulator:LATEST:jar -Ddest=simulator.jar"
+                    }      
+                    sh "unzip -o ./target/*.zip"
+                    telemetry = sh(returnStdout: true, script:"find . -name 'telemetry*.jar'").trim()
+                    analytics = sh(returnStdout: true, script:"find . -name 'analytics*.jar'").trim()
+                    sh "java -cp ${telemetry}:${analytics}:simulator.jar com.lidar.simulation.Simulator"
+                }
+            }
+        }
+        stage('Publish')
+        {
+            when
+            {
+                anyOf
+                {
+                    branch "release/*"
+                }
+            }
+            steps 
+            {
+                script 
+                {
+                    configFileProvider([configFile(fileId: '8412b7f1-a630-4f33-9b49-fe3e1de2ad03',variable: 'MAVEN_SETTINGS_XML')]) 
+                    {
+                        sh "mvn -s $MAVEN_SETTINGS_XML clean deploy -DskipTests"
+                    }                
+                }
+            }
+        }
+        stage('Git-tag push')
+        {
+            when
+            {
+                anyOf
+                {
+                    branch "release/*"
+                }
+            }
+            steps 
+            {
+                script 
+                {
+                    sh 'git clean -f -x'
+                    sh "git tag ${TAG}"
+                    withCredentials([string(credentialsId: 'api_token', variable: 'TOKEN')]) { 
+                        sh "git push http://Maciob:$TOKEN@3.11.200.189/Maciob/product --tags"
+                    }
+
+                }
+            }
+        }
+    }
+    post
+    {
+        failure
+        {
+            emailext recipientProviders: [culprits()], subject: 'Build failure', body: 'Build failed.', attachLog: true
+        }
+        success
+        {
+            emailext recipientProviders: [culprits()], subject: 'Build successful', body: 'Build successful.', attachLog: true
+        }
+    }
+}
+
+
+
+

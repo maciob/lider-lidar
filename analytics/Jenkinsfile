@@ -1,0 +1,236 @@
+pipeline 
+{
+    options 
+    {
+        timestamps()
+    }
+    agent any
+    tools
+    {
+        maven 'Maven3.6.2' 
+        jdk 'jdk8'
+    }
+    environment
+    {
+        TAG = ''
+        COMMIT_MESSAGE = ''
+        BRANCH = ''
+        PREFIX = ''
+    }
+    stages 
+    {
+        stage("Checkout") 
+        {
+            steps 
+            {
+                deleteDir()
+                checkout scm
+            }
+        }
+        stage("Calculate tag")
+        {
+            when
+            {
+                anyOf
+                {
+                    branch "release/*"
+                }
+            }
+            steps
+            {
+                script
+                {
+                    withCredentials([string(credentialsId: 'api_token', variable: 'TOKEN')]) { 
+                        sh "git fetch http://jenkins:$TOKEN@3.11.200.189/Maciob/analytics --tags"
+                    }
+                    sh "echo 'calculate tag'"
+                    BRANCH = env.BRANCH_NAME
+                    sh "echo '${BRANCH}'"
+                    PREFIX = sh(returnStdout: true, script:"echo '${BRANCH}' | cut -d '/' -f2").trim()
+                    sh "echo '${PREFIX}'"
+                    ORIGINAL = sh(returnStdout: true, script:"git tag | grep ${PREFIX} | tail -1 | cut -d '/' -f2").trim()
+                    sh "echo '${ORIGINAL}'"
+                    try
+                    {
+                        SUFFIX = sh(returnStdout: true, script:"echo '${ORIGINAL}' | cut -d '.' -f3 ").trim()
+                        SUFFIX = "${SUFFIX}" as int
+                        SUFFIX = SUFFIX + 1
+                        TAG = sh(returnStdout: true, script:"echo '${PREFIX}.${SUFFIX}'").trim()
+                        sh "echo '${TAG}'"
+                    }
+                    catch(exc)
+                    {             
+                        TAG = sh(returnStdout: true, script:"echo '${PREFIX}.0'").trim()
+                        sh "echo '${TAG}'"                   
+                    }
+                    sh "mvn versions:set -DnewVersion=${TAG}"
+                }
+            }
+        }
+        stage('Build') 
+        {
+            when
+            {
+                anyOf
+                {
+                    branch "master"
+                    branch "release/*"
+                    branch "feature/*"
+                }
+            }
+            steps 
+            {
+                script 
+                {
+                    configFileProvider([configFile(fileId: '8412b7f1-a630-4f33-9b49-fe3e1de2ad03',variable: 'MAVEN_SETTINGS_XML')]) 
+                    {
+                        sh "mvn -s $MAVEN_SETTINGS_XML clean compile"
+                    }
+                }
+            }
+        }
+        stage('Test') 
+        {
+            when
+            {
+                anyOf
+                {
+                    branch "master"
+                    branch "release/*"
+                    branch "feature/*"
+                }
+            }
+            steps 
+            {
+                script 
+                {
+                    configFileProvider([configFile(fileId: '8412b7f1-a630-4f33-9b49-fe3e1de2ad03',variable: 'MAVEN_SETTINGS_XML')]) 
+                    {
+                        sh "mvn -s $MAVEN_SETTINGS_XML clean test"
+                    }
+                }
+            }
+        }
+        stage('Package') 
+        {
+            when
+            {
+                anyOf
+                {
+                    branch "master"
+                    branch "release/*"
+                    branch "feature/*"
+                }
+            }
+            steps 
+            {
+                script 
+                {
+                    configFileProvider([configFile(fileId: '8412b7f1-a630-4f33-9b49-fe3e1de2ad03',variable: 'MAVEN_SETTINGS_XML')]) 
+                    {
+                        sh "mvn -s $MAVEN_SETTINGS_XML clean package"
+                    }
+                    COMMIT_MESSAGE = sh(returnStdout: true, script: 'git log -1 --oneline | cut -d ")" -f2').trim()
+                }
+            }
+        }
+        stage('E2E') 
+        {
+            when
+            {
+                expression { env.BRANCH_NAME.contains("master") || env.BRANCH_NAME.contains("release/") || ( env.BRANCH_NAME.contains("feature/") && COMMIT_MESSAGE.contains("e2e"))}
+            }
+            steps 
+            {
+                script 
+                {
+                    if(env.BRANCH_NAME.contains("release/"))
+                    {
+                        try
+                        {
+                            sh "echo '${PREFIX}'"
+                            withCredentials([string(credentialsId: 'secret_jfrog', variable: 'PASS')]) { 
+                                SUFFIX = sh(returnStdout: true, script: "curl -s -u admin:$PASS http://3.11.200.189:8081/artifactory/libs-release-local/com/lidar/telemetry/ | grep -F ${PREFIX} | cut -d '/' -f1 | cut -d '.' -f3 |sort -n | tail -1").trim()
+                            }
+                            sh "echo '${SUFFIX}'"
+                            configFileProvider([configFile(fileId: '8412b7f1-a630-4f33-9b49-fe3e1de2ad03',variable: 'MAVEN_SETTINGS_XML')]) 
+                            {
+                                sh "mvn -s $MAVEN_SETTINGS_XML dependency:get -Dartifact=com.lidar:telemetry:${PREFIX}.${SUFFIX}:jar -Ddest=telemetry.jar"
+                                sh "mvn -s $MAVEN_SETTINGS_XML dependency:get -Dartifact=com.lidar:simulator:99-SNAPSHOT:jar -Ddest=simulator.jar"
+                            }       
+                        }
+                        catch(exc)
+                        {
+                            return "No such a version"
+                        }
+                    }
+                    else
+                    {
+                        configFileProvider([configFile(fileId: '8412b7f1-a630-4f33-9b49-fe3e1de2ad03',variable: 'MAVEN_SETTINGS_XML')]) 
+                        {
+                            sh "mvn -s $MAVEN_SETTINGS_XML dependency:get -Dartifact=com.lidar:simulator:99-SNAPSHOT:jar -Ddest=simulator.jar"
+                            sh "mvn -s $MAVEN_SETTINGS_XML dependency:get -Dartifact=com.lidar:telemetry:99-SNAPSHOT:jar -Ddest=telemetry.jar"
+                        }       
+                    }
+                    sh "cp target/*.jar analytics.jar"
+                    sh "java -cp analytics.jar:telemetry.jar:simulator.jar com.lidar.simulation.Simulator"   
+                }
+            }
+        }
+        stage('Publish')
+        {
+            when
+            {
+                anyOf
+                {
+                    branch "master"
+                    branch "release/*"
+                }
+            }
+            steps 
+            {
+                script 
+                {
+                    configFileProvider([configFile(fileId: '8412b7f1-a630-4f33-9b49-fe3e1de2ad03',variable: 'MAVEN_SETTINGS_XML')]) 
+                    {
+                        sh "mvn -s $MAVEN_SETTINGS_XML clean deploy -DskipTests"
+                    }                
+                }
+            }
+        }
+        stage('Git-tag push')
+        {
+            when
+            {
+                anyOf
+                {
+                    branch "release/*"
+                }
+            }
+            steps 
+            {
+                script 
+                {
+                    sh 'git clean -f -x'
+                    sh "git tag ${TAG}"
+                    withCredentials([string(credentialsId: 'api_token', variable: 'TOKEN')]) { 
+                        sh "git push http://Maciob:$TOKEN@3.11.200.189/Maciob/analytics --tags"
+                    }
+                }
+            }
+        }
+    }
+    post
+    {
+        failure
+        {
+            emailext recipientProviders: [culprits()], subject: 'Build failure', body: 'Build failed.', attachLog: true
+        }
+        success
+        {
+            emailext recipientProviders: [culprits()], subject: 'Build successful', body: 'Build successful.', attachLog: true
+        }
+    }
+}
+
+
